@@ -140,7 +140,7 @@
           </div>
         </div>
         <div class="btn-row">
-          <button class="btn-primary" id="btnGps">Use my location</button>
+          <button class="btn-primary" id="btnGps">Start live tracking</button>
           <button id="btnSim">Simulate</button>
         </div>
         <div class="fromline">
@@ -14846,7 +14846,8 @@ window.CAMPUS = {
   var VB = C.viewBox || {w:1224,h:792};
   var floors={}, nodes={}, adj={};
   var state={pos:null,building:null,sim:false,dest:null,route:null,floorView:null,
-             startKey:null,manualStart:"",fitAll:false,view:null,viewFloor:null};
+             startKey:null,manualStart:"",fitAll:false,view:null,viewFloor:null,
+             watchId:null,tracking:false,lastRouteKey:null,lastRouteAt:0,lastFixAt:0};
 
   // ---------- graph ----------
   C.floors.forEach(function(f){
@@ -14952,27 +14953,57 @@ window.CAMPUS = {
     document.getElementById("gpsMain").textContent=main;
     document.getElementById("gpsSub").textContent=sub;
   }
+  var gpsBtn=document.getElementById("btnGps");
   function applyPos(pos,acc,sim){
-    state.pos=pos; state.sim=!!sim;
+    state.pos=pos; state.sim=!!sim; state.lastFixAt=Date.now();
     var ent=C.buildings[BID].entrance, m=Math.round(haversine(pos,ent));
     var inside=!!geoToPlan(pos);
-    setGps("ok",(sim?"Simulated — ":"")+(inside?"On campus":"Off campus"),
-      (inside? "Inside the campus footprint" : m+" m from the main entrance")+" · accuracy ±"+Math.round(acc)+" m");
-    if(state.dest) route();
+    setGps("ok",(sim?"Simulated — ":state.tracking?"Live — ":"")+(inside?"On campus":"Off campus"),
+      (inside?"Inside the campus footprint":m+" m from the main entrance")+" · accuracy ±"+Math.round(acc)+" m · updated just now");
+
+    // Redraw every fix so the green marker follows the device continuously.
+    draw();
+
+    // Recalculate only when the nearest walkable node changes (or every 10 s).
+    // This avoids GPS jitter constantly resetting a user's zoom and pan.
+    if(state.dest){
+      var start=resolveStart(), now=Date.now();
+      if(start && (start.key!==state.lastRouteKey || now-state.lastRouteAt>10000)){
+        state.lastRouteKey=start.key; state.lastRouteAt=now;
+        route({preserveView:true});
+      }
+    }
   }
-  document.getElementById("btnGps").addEventListener("click",function(){
+  function stopLiveTracking(message){
+    if(state.watchId!==null && navigator.geolocation) navigator.geolocation.clearWatch(state.watchId);
+    state.watchId=null; state.tracking=false;
+    gpsBtn.textContent="Start live tracking";
+    gpsBtn.setAttribute("aria-pressed","false");
+    if(message) setGps("warn","Tracking paused",message);
+  }
+  function startLiveTracking(silent){
     if(!("geolocation" in navigator)){setGps("err","Not supported","This browser has no Geolocation API.");return;}
-    setGps("warn","Requesting…","Approve the browser permission prompt.");
-    navigator.geolocation.watchPosition(function(p){
+    if(state.watchId!==null)return;
+    state.tracking=true; state.sim=false; state.manualStart=""; sel.value="";
+    gpsBtn.textContent="Stop live tracking";
+    gpsBtn.setAttribute("aria-pressed","true");
+    setGps("warn","Starting live tracking…",silent?"Restoring your last location permission.":"Approve the browser permission prompt if asked.");
+    state.watchId=navigator.geolocation.watchPosition(function(p){
       applyPos({lat:p.coords.latitude,lng:p.coords.longitude},p.coords.accuracy||30,false);
     },function(err){
       var msg=err.code===1?"Permission denied — allow location in site settings."
-            :err.code===2?"Position unavailable — no GPS or Wi-Fi fix."
-            :"Timed out getting a fix.";
-      setGps("err","Location unavailable",msg+" Pick a starting point instead.");
-    },{enableHighAccuracy:true,timeout:10000,maximumAge:5000});
+            :err.code===2?"Position unavailable — waiting for a GPS or Wi-Fi fix."
+            :"Waiting for a new location fix.";
+      if(err.code===1){ stopLiveTracking(); setGps("err","Location unavailable",msg+" Pick a starting point instead."); }
+      else setGps("warn","Live tracking active",msg);
+    },{enableHighAccuracy:true,timeout:15000,maximumAge:2000});
+  }
+  gpsBtn.addEventListener("click",function(){
+    if(state.tracking) stopLiveTracking("Your last position remains on the map.");
+    else startLiveTracking(false);
   });
   document.getElementById("btnSim").addEventListener("click",function(){
+    stopLiveTracking();
     var e=C.buildings[BID].entrance;
     applyPos({lat:e.lat-0.0006,lng:e.lng-0.0008},14,true);
   });
@@ -15045,7 +15076,8 @@ window.CAMPUS = {
   function meters(u){return Math.round(u*C.metersPerUnit);}
   function sideOf(a,b){return b.x>=a.x?(b.y<a.y?"left":"right"):(b.y<a.y?"right":"left");}
 
-  function route(){
+  function route(opts){
+    opts=opts||{};
     var start=resolveStart();
     if(!start||!state.dest)return;
     state.startKey=start.key;
@@ -15054,7 +15086,7 @@ window.CAMPUS = {
     card.hidden=false;
     if(!r){ document.getElementById("summary").innerHTML=""; document.getElementById("steps").innerHTML='<li>No route found between those points in the data.</li>'; return; }
     state.route=r;
-    state.view=null;            // refit the viewport to the new route
+    if(!opts.preserveView) state.view=null; // keep the user's zoom during live GPS updates
     state.floorView=nodes[start.key].floor;
 
     var dst=nodes[state.dest], steps=[], totalU=0, p=r.path;
@@ -15291,9 +15323,16 @@ window.CAMPUS = {
         if(n.type==="elevator"||n.type==="stairs") pin(n,"var(--orange)",(n.name||"Elevator"),((n.name||"E").charAt(0)),true);
       });
       var sN=nodes[state.startKey];
-      if(sN&&sN.floor===fid) pin(sN,"var(--green)","You are here",null);
+      var livePt=(state.pos && fid===groundFloor.id)?geoToPlan(state.pos):null;
+      if(livePt) pin(livePt,"var(--green)",state.tracking?"Live location":"You are here",null);
+      else if(sN&&sN.floor===fid) pin(sN,"var(--green)","You are here",null);
       var dN=nodes[state.dest];
       if(dN&&dN.floor===fid) pin(dN,"var(--red)",dN.name,null);
+    }
+
+    if(!state.route && state.pos && fid===groundFloor.id){
+      var currentPt=geoToPlan(state.pos);
+      if(currentPt) pin(currentPt,"var(--green)",state.tracking?"Live location":"You are here",null);
     }
 
     // 6. floor hint
@@ -15371,6 +15410,20 @@ window.CAMPUS = {
 
   document.getElementById("campusName").textContent=C.name;
   renderResults(); renderTabs(); draw();
+
+  // Resume live tracking automatically for returning users who already granted access.
+  if(navigator.permissions && navigator.permissions.query){
+    navigator.permissions.query({name:"geolocation"}).then(function(p){
+      if(p.state==="granted") startLiveTracking(true);
+    }).catch(function(){});
+  }
+  document.addEventListener("visibilitychange",function(){
+    if(document.visibilityState==="visible" && state.tracking && state.watchId===null) startLiveTracking(true);
+  });
+  window.addEventListener("pagehide",function(){
+    if(state.watchId!==null && navigator.geolocation) navigator.geolocation.clearWatch(state.watchId);
+    state.watchId=null;
+  });
 
   // Deep links: ?to=D2-01&sim=1 — handy for QR codes on doors and posters
   var qs=new URLSearchParams(location.search);
